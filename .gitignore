@@ -1,0 +1,15 @@
+# Never commit these - they belong to Omnissa, not this repo, and are
+# required locally but must be obtained through your own entitlement.
+uagdeploy.psm1
+uagdeploy*.ps1
+
+# Your own real deployment INIs (passwords, real network details) -
+# keep uag-pve-api-example.ini as the only tracked example.
+*.ini
+!uag-pve-api-example.ini
+
+# SSH keys, generated payloads, local test output
+*-key
+*-key.pub
+uag-userdata.*
+uag-metadata.yaml
