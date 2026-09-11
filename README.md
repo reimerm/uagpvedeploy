@@ -203,13 +203,11 @@ The `--cpu host` requirement (a hard kernel-panic fix, not a performance
 tweak) was independently confirmed by **Robert Schumann**, who deployed the
 same UAG appliance on his own Proxmox host via a different cloud-init
 delivery mechanism and reached the same conclusion. His tested hardware
-baseline (`--cpu host`, `--machine q35`, `--bios seabios`, `--scsihw
-virtio-scsi-single`, `--balloon 0`) is adopted here in full.
+baseline is adopted here in full.
 
 ## License and copyright
 
-The code in this repository is original work, licensed under [choose a
-license — MIT/Apache-2.0 are reasonable defaults for something like this].
+The code in this repository is original work, licensed under MIT.
 UAG itself, `uagdeploy.psm1`, and every `uagdeploy*.ps1` script are Omnissa's
 own copyrighted software and are not included here in any form. "Omnissa"
 and "Unified Access Gateway" are trademarks of Omnissa, LLC; this project is
