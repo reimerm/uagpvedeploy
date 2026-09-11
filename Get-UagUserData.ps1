@@ -1,40 +1,31 @@
 # Get-UagUserData.ps1
-# ---------------------------------------------------------------------------
-# Produces UAG's own cloud-init "user-data" configuration payload from a
-# regular UAG INI file, for platforms that don't have a ready-made
-# uagdeploy*.ps1 of their own (Proxmox, libvirt, Unraid, generic KVM).
+# -----------------------------------------------------------------------
+# Produces UAG's own cloud-init "user-data" payload from a regular UAG INI
+# file, for platforms without a ready-made uagdeploy*.ps1 of their own
+# (Proxmox, libvirt, Unraid, generic KVM).
 #
-# This is an independent implementation written against UAG's own
-# documented cloud-init user-data field interface - the field NAMES below
-# (DNS, rootPasswordExpirationDays, sshEnabled, ...) are UAG's own
-# interface, the same ones its admin guide and every uagdeploy*.ps1
-# variant document and populate; they are not something invented here.
-# How this script builds and emits them (the ordered-hashtable/StringBuilder
-# approach below) is this project's own code.
+# Field names (DNS, rootPasswordExpirationDays, sshEnabled, ...) are UAG's
+# own documented cloud-init interface, not invented here. How this script
+# builds and emits them is this project's own code.
 #
-# This script DOES call a number of *exported* helper functions from
-# Omnissa's own uagdeploy.psm1 (ImportIni, GetJSONSettings, ReadOsLoginUsername,
-# ValidateAdminMaxConcurrentSessions, and similar validators) - through that
-# module's public API, exactly the way uagdeploy.ps1 itself does for the
-# officially supported platforms (vSphere, Nutanix, OpenStack, ...). That
-# module is Omnissa's own copyrighted software, is NOT included in this
-# repository, and is NOT redistributed by it. You need your own valid
-# Omnissa/VMware entitlement to obtain uagdeploy.psm1 and place it alongside
-# this script - see the README for where it ships.
-#
-# Prerequisite: uagdeploy.psm1 (the original Omnissa module, obtained
-# separately - see above) is in the same directory as this script.
+# This script calls a number of *exported* helper functions from Omnissa's
+# own uagdeploy.psm1 (ImportIni, GetJSONSettings, ReadOsLoginUsername,
+# validators) through that module's public API, the same way uagdeploy.ps1
+# does for the officially supported platforms. uagdeploy.psm1 is Omnissa's
+# own copyrighted software, not included or redistributed here; obtain it
+# through your own Omnissa/VMware entitlement and place it alongside this
+# script (see README.md).
 #
 # Examples:
-#   pwsh ./Get-UagUserData.ps1 -IniFile uag-lab-test.ini -RootPwd 'M3inRoot!Pwd' -AdminPwd 'M3inAdmin!Pwd'
-#   pwsh ./Get-UagUserData.ps1 -IniFile uag-lab-test.ini -RootPwd 'M3inRoot!Pwd' -NoStaticIpFields
+#   pwsh ./Get-UagUserData.ps1 -IniFile your-instance.ini -RootPwd 'M3inRoot!Pwd' -AdminPwd 'M3inAdmin!Pwd'
+#   pwsh ./Get-UagUserData.ps1 -IniFile your-instance.ini -RootPwd 'M3inRoot!Pwd' -NoStaticIpFields
 #
 # Produces in the current directory:
 #   uag-userdata.raw.txt      -> unwrapped plain text (as used by OpenStack)
 #   uag-userdata.wrapped.yaml -> wrapped as #cloud-config/write_files (as used by Nutanix/KubeVirt)
 #   uag-userdata.raw.b64 / uag-userdata.wrapped.b64 -> base64 versions of each
 #   uag-metadata.yaml         -> minimal NoCloud meta-data file
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
 
 param(
     [Parameter(Mandatory = $true)] [string]$IniFile,
@@ -111,10 +102,9 @@ function Format-UagUserDataIndent {
 function ConvertTo-UagCloudInitWrapper {
     # Wraps a raw UAG user-data payload in a minimal cloud-config
     # write_files stanza. The target path is NOT a free choice here - it
-    # has to be exactly /var/lib/cloud/instance/user-data.txt, because
-    # that's the path UAG's own firstboot logic (uag_sysconfig, which ships
-    # inside the appliance itself) reads on generic-KVM platforms. See
-    # uag-kvm-adaptation-plan.md for how that path was identified.
+    # has to be exactly /var/lib/cloud/instance/user-data.txt, the path
+    # UAG's own firstboot script (uag_sysconfig, inside the appliance
+    # itself) reads on generic-KVM platforms.
     param([string]$IndentedContent)
 
     $sb = [System.Text.StringBuilder]::new()

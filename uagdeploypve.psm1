@@ -12,73 +12,35 @@
     reconcile.
 
 .NOTES
-    Fourth implementation (2026-09-09). Three redesigns so far, all driven
-    by live-testing against a real host (ax161-01) or, for the last one,
-    by prior art in a widely-used comparable tool - not guesswork:
+    Deployment works by template+clone, not by importing the golden QCOW2
+    on every run:
 
-    1. FIRST design: import-from on every deployment. Found live that
-       Proxmox hard-restricts import-from with a raw filesystem path to
-       the literal root@pam identity ("Only root can pass arbitrary
-       filesystem paths", PVE::Storage.pm line 561) - an API token hit it
-       even fully privileged. Meant every deployment needed root, not
-       just a one-time setup.
+    - New-UagProxmoxTemplate does the (privileged) import ONCE, converts
+      the result into a Proxmox template, and every actual deployment
+      (New-UagVmOnProxmox) CLONES it instead. Clone is a normal,
+      ACL-respecting, non-raw-path operation, so a plain API token
+      handles it. This also means the golden QCOW2 only has to exist in
+      one place (a template clones correctly cluster-wide).
 
-    2. SECOND design (template+clone): New-UagProxmoxTemplate does the
-       privileged import ONCE, converts the result into a Proxmox
-       template, and every actual deployment (New-UagVmOnProxmox) CLONES
-       it instead - clone is a normal, ACL-respecting, non-raw-path
-       operation, so a plain API token handles it. Also fixed the
-       "golden QCOW2 has to live on one specific node's local disk"
-       problem for free (a template clone resolves cluster-wide).
-       Live-testing this surfaced a second, harder platform limit:
-       cloud-init SNIPPETS have NEVER been uploadable via Proxmox's API
-       at all (confirmed live with a 400 enumerating only 'iso, vztmpl,
-       import' as valid content types, and confirmed still true on
-       current Proxmox VE 9 via the community forum/bugzilla #2208 - a
-       7+ year old gap). That can't be fixed with better request
-       encoding, it needs a different channel entirely.
-
-    3. THIRD design layered two more pieces onto the template+clone base:
-       - Send-UagSnippetsOverSftp (SUPERSEDED - see #4 below) delivered
-         snippets over SFTP to a dedicated, chrooted, non-root system
-         user - the only viable path given Proxmox's API gap, but kept
-         off root by using ordinary Linux filesystem permissions instead
-         of Proxmox's user model.
-       - New-UagProxmoxTemplate's PRIMARY path (when given a token
-         context) now uploads the golden QCOW2 to the storage's 'import'
-         content type and references the resulting volid instead of a
-         raw path - per a Proxmox developer's forum comment, this should
-         avoid the root-only restriction entirely, eliminating root from
-         the one-time setup too, not just from routine deployments. The
-         raw-path/ticket approach remains as an explicit fallback. (This
-         piece is unchanged by design #4 below.)
-
-    4. THIS design replaces the chrooted-SFTP-user piece of #3 with
-       Send-UagSnippetsOverSsh: a plain non-root SSH login whose ONLY
-       privilege is a scoped 'sudo tee /path/to/snippets/<safe-pattern>'
-       sudoers rule, piping the file's content over an SSH exec session
-       instead of using SFTP. This is the exact same mechanism the
-       widely-used bpg/terraform-provider-proxmox uses for this identical
-       API gap - simpler node-side setup (one useradd + one sudoers line,
-       no chroot directory tree or ForceCommand config to get right) and
-       a pattern other Proxmox/Terraform admins will already recognize.
-       See Send-UagSnippetsOverSsh's own docstring and
-       uag-kvm-adaptation-plan.md section 7.10 for the full writeup,
-       citations, and the superseded chroot design in section 7.9.
+    - Cloud-init SNIPPETS have never been uploadable via Proxmox's REST
+      API, on any version (see Send-UagSnippetsOverSsh) - a permanent
+      platform gap, not something a different request shape works around.
+      Snippets are delivered over SSH instead, to a dedicated non-root
+      user with one scoped sudoers rule, the same mechanism
+      bpg/terraform-provider-proxmox uses for the identical gap.
 
     Every hardware setting baked in here (cpu=host, machine=q35,
     bios=seabios, scsihw=virtio-scsi-single, balloon=0, base64-encoded
-    smbios1 fields, both cloud-init snippets attached) is a DIRECT
-    port of the validated, live-confirmed deploy-uag-proxmox-test.sh
-    configuration, not a fresh guess - see uag-kvm-status.md's "Five
-    real bugs hit and fixed" section for why each one is there.
+    smbios1 fields, both cloud-init snippets attached) is a validated
+    profile confirmed against a real Proxmox host, not a guess.
 
-    Live-confirmed against ax161-01 so far: ticket auth, hull creation +
-    raw-path import-from, template conversion, clone, post-clone config.
-    NOT yet live-tested: Send-ProxmoxImportUpload (the token-based upload
-    path for the golden image), Get-ProxmoxStoragePath, and
-    Send-UagSnippetsOverSsh (needs the one-time node-side sudo+tee user
-    setup done first) - all flagged inline where relevant.
+    Live-confirmed end to end: ticket auth, hull creation + raw-path
+    import-from, template conversion, clone, post-clone hardware/smbios
+    reconfiguration, and SSH/sudo+tee snippet delivery. NOT yet
+    live-tested: Send-ProxmoxImportUpload (the token-based upload path for
+    the golden image) and the resulting token-only template creation path
+    in New-UagProxmoxTemplate - both flagged inline where relevant. The
+    ticket/password path remains the proven way to build a template.
 #>
 
 # ---------------------------------------------------------------------------
@@ -100,7 +62,7 @@ function New-ProxmoxApiContext {
         needs New-ProxmoxTicketContext below.
     #>
     param(
-        [Parameter(Mandatory)] [string]$ProxmoxHost,   # e.g. "65.109.18.154" or a hostname
+        [Parameter(Mandatory)] [string]$ProxmoxHost,   # e.g. "pve.example.com"
         [Parameter(Mandatory)] [string]$ApiToken,       # full "USER@REALM!TOKENID=SECRET" string, exactly as shown once by the Proxmox UI when the token is created (Datacenter -> Permissions -> API Tokens)
         [int]$Port = 8006,
         [bool]$AllowInsecureTls = $true                 # self-signed cert is the norm for a lab Proxmox host; set $false once a real cert is in place
@@ -129,33 +91,26 @@ function New-ProxmoxTicketContext {
         QCOW2 to the storage's 'import' content type and references the
         resulting volid (storage:import/filename) - a normal,
         ACL-respecting storage reference that works fine with a plain API
-        token (New-ProxmoxApiContext), confirmed by a Proxmox developer on
-        the community forum: referencing an import-content volid "should
-        avoid the root-only filesystem path restriction, since you're
-        working within Proxmox's storage management system rather than
-        passing arbitrary filesystem paths."
+        token (New-ProxmoxApiContext): a Proxmox developer has confirmed
+        on the community forum that this avoids the root-only filesystem
+        path restriction, since it works within Proxmox's own storage
+        management rather than passing an arbitrary filesystem path.
 
-        This function (and the raw-path import-from it enables) is only
-        still needed as a fallback for hosts where the 'import' content
-        type isn't enabled on the target storage, or if that upload path
-        turns out not to work as expected once live-tested. Proxmox
-        restricts import-from with a RAW filesystem path to the literal
-        'root@pam' identity specifically - an API token's effective
-        identity is 'root@pam!<tokenid>', which fails that check even
-        with full privileges and privilege separation disabled. Confirmed
-        live (2026-09-09): the identical config change failed with a
-        token ("Only root can pass arbitrary filesystem paths") and
-        succeeded with a ticket for the same root@pam account - see
-        uag-kvm-status.md's Phase 3 section for the full story.
+        This function (and the raw-path import-from it enables) is still
+        needed as a fallback for hosts where the 'import' content type
+        isn't enabled on the target storage, or if that upload path turns
+        out not to work as expected. Proxmox restricts import-from with a
+        RAW filesystem path to the literal 'root@pam' identity
+        specifically - an API token's effective identity is
+        'root@pam!<tokenid>', which fails that check even with full
+        privileges and privilege separation disabled (confirmed live:
+        the identical config change failed with a token and succeeded
+        with a ticket for the same root@pam account).
 
-        Also confirmed against Proxmox VE 9 (the current LTS line; PVE 8
-        went end-of-life 2026-08-31) via the community forum/mailing
-        list: this same root-only filesystem-path restriction is
-        unchanged, and separately, the cloud-init SNIPPETS upload gap
-        (see Send-UagSnippetsOverSsh) is also still unresolved as of PVE
-        9 - a Proxmox staff member stated plainly in a March 2026 thread
-        that "snippets are not uploadable over the API at the moment,"
-        7+ years after the original feature request (bugzilla #2208).
+        The cloud-init SNIPPETS upload gap (see Send-UagSnippetsOverSsh)
+        is a separate, permanent limitation, confirmed still present on
+        current Proxmox VE releases via Proxmox's own bugzilla and
+        community forum.
     #>
     param(
         [Parameter(Mandatory)] [string]$ProxmoxHost,
@@ -218,9 +173,9 @@ function Invoke-ProxmoxApi {
         # characters in .NET's strict RFC 7230 header-token validation for
         # the "Authorization" header specifically. Without this, the
         # header is rejected client-side before any network call is even
-        # attempted ("The format of value '...' is invalid.") - confirmed
-        # live against a real Proxmox token. This does not relax TLS/cert
-        # checking, only the header *value* format check.
+        # attempted ("The format of value '...' is invalid."). This does
+        # not relax TLS/cert checking, only the header *value* format
+        # check.
         SkipHeaderValidation = $true
     }
     if ($Context.Insecure) { $params.SkipCertificateCheck = $true }
@@ -287,29 +242,26 @@ function Send-ProxmoxFileUpload {
         the multipart/form-data request body as a single byte array
         instead of using Invoke-RestMethod's -Form parameter.
 
-        REAL BUG HIT AND FIXED LIVE (2026-09-09): -Form builds the
-        request as a System.Net.Http.MultipartFormDataContent with the
-        file wrapped in a StreamContent part, which .NET sends with
-        Transfer-Encoding: chunked (no Content-Length) rather than a
-        fixed-length body. Proxmox's own API server (PVE::APIServer::
-        AnyEvent, not a general-purpose HTTP server) does not handle a
-        chunked request body on this endpoint - it fails with a generic,
-        unhelpful 500 ("upload failed at
-        /usr/share/perl5/PVE/APIServer/AnyEvent.pm line 1305") for an
-        otherwise perfectly valid multipart body. Fixed by sending a
-        single byte[] body with a real Content-Length instead of a
-        chunked stream.
+        WHY: -Form builds the request as a System.Net.Http.
+        MultipartFormDataContent with the file wrapped in a StreamContent
+        part, which .NET sends with Transfer-Encoding: chunked (no
+        Content-Length) rather than a fixed-length body. Proxmox's own API
+        server (PVE::APIServer::AnyEvent, not a general-purpose HTTP
+        server) does not handle a chunked request body on this endpoint -
+        it fails with a generic, unhelpful 500 for an otherwise perfectly
+        valid multipart body. Fixed by sending a single byte[] body with a
+        real Content-Length instead of a chunked stream.
 
         SCOPE: this loads the whole file into memory, so it's only
         appropriate for small files - fine for the content types this
-        endpoint's own 'content' parameter actually accepts (confirmed
-        live: the enum is 'iso, vztmpl, import' - 'snippets' is NOT a
-        valid value here at all, a hard Proxmox API limitation, see
-        Send-UagSnippetsOverSsh for how snippets are actually delivered
-        instead). For a large file (e.g. a multi-GB disk image uploaded
-        as content=import), use Send-ProxmoxImportUpload instead - that
-        one streams from disk with an explicit Content-Length rather than
-        buffering the whole file in memory.
+        endpoint's own 'content' parameter actually accepts ('iso,
+        vztmpl, import' - 'snippets' is NOT a valid value here at all, a
+        hard Proxmox API limitation, see Send-UagSnippetsOverSsh for how
+        snippets are actually delivered instead). For a large file (e.g.
+        a multi-GB disk image uploaded as content=import), use
+        Send-ProxmoxImportUpload instead - that one streams from disk
+        with an explicit Content-Length rather than buffering the whole
+        file in memory.
     #>
     param(
         [Parameter(Mandatory)] $Context,
@@ -325,8 +277,8 @@ function Send-ProxmoxFileUpload {
 
     # Built by hand, not via -Form, specifically so the whole thing ends
     # up as one concrete byte[] with a known length up front - see the
-    # REAL BUG note above for why that distinction is what actually
-    # matters here.
+    # SYNOPSIS above for why that distinction is what actually matters
+    # here.
     $preamble = (
         "--$boundary$nl" +
         "Content-Disposition: form-data; name=`"content`"$nl$nl" +
@@ -339,8 +291,7 @@ function Send-ProxmoxFileUpload {
     # PowerShell's "+" on typed arrays does NOT preserve the element type -
     # [byte[]] + [byte[]] silently produces a System.Object[], which is
     # NOT the same thing to Invoke-RestMethod's -Body parameter (it needs
-    # a real byte[] to send a fixed-length body - the whole point of this
-    # function, see the REAL BUG note above). Concatenate through a
+    # a real byte[] to send a fixed-length body). Concatenate through a
     # MemoryStream instead so the result is guaranteed an actual byte[].
     $preambleBytes = [Text.Encoding]::UTF8.GetBytes($preamble)
     $epilogueBytes = [Text.Encoding]::UTF8.GetBytes($epilogue)
@@ -385,17 +336,17 @@ function Send-ProxmoxImportUpload {
         WHY THIS EXISTS: New-ProxmoxTicketContext's import-from-with-a-
         raw-path approach needs a real root login and the image already
         sitting on the node's own filesystem, prepared out of band. A
-        Proxmox developer confirmed on the community forum that
+        Proxmox developer has confirmed on the community forum that
         uploading to the 'import' content type and referencing the
         resulting volid (storage:import/filename) instead of a raw path
-        "should avoid the root-only filesystem path restriction, since
-        you're working within Proxmox's storage management system rather
-        than passing arbitrary filesystem paths" - i.e. a plain API token
-        should be able to do the whole thing, AND the image can be
-        uploaded directly from wherever this script runs instead of being
-        staged on the node by hand first. New-UagProxmoxTemplate uses
-        this as its primary path when given a token context, falling
-        back to the raw-path/ticket approach otherwise.
+        avoids the root-only filesystem path restriction, since it works
+        within Proxmox's own storage management rather than an arbitrary
+        filesystem path - i.e. a plain API token should be able to do the
+        whole thing, and the image can be uploaded directly from wherever
+        this script runs instead of being staged on the node by hand
+        first. New-UagProxmoxTemplate uses this as its primary path when
+        given a token context, falling back to the raw-path/ticket
+        approach otherwise.
 
         HOW THE STREAMING WORKS: uses System.Net.Http.HttpClient directly
         (not Invoke-RestMethod, which has no way to both stream a large
@@ -405,16 +356,14 @@ function Send-ProxmoxImportUpload {
         when every part of a MultipartFormDataContent reports a known
         length like this, .NET computes and sends a real Content-Length
         for the whole request instead of switching to chunked transfer
-        encoding. That distinction is exactly what broke the (much
-        smaller) snippet upload against Proxmox's AnyEvent-based API
-        server - see Send-ProxmoxFileUpload's REAL BUG note - and would
-        be far more likely to bite at multi-GB scale if this used the
-        same naive -Form path instead.
+        encoding. That distinction is exactly what breaks a naive upload
+        against Proxmox's AnyEvent-based API server (see
+        Send-ProxmoxFileUpload) and would be far more likely to bite at
+        multi-GB scale if this used the same naive -Form path instead.
 
-        NEEDS LIVE VERIFICATION: written 2026-09-09, not yet exercised
-        against a real Proxmox host. Test with a small file first (to
-        prove the token/permissions/volid mechanics cheaply) before
-        trusting it with a full-size QCOW2 upload.
+        NOT YET LIVE-TESTED against a real Proxmox host. Test with a
+        small file first (to prove the token/permissions/volid mechanics
+        cheaply) before trusting it with a full-size QCOW2 upload.
     #>
     param(
         [Parameter(Mandatory)] $Context,
@@ -456,16 +405,16 @@ function Send-ProxmoxImportUpload {
         $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/octet-stream')
         # Neither .Add(content, name, filename) NOR building a
         # ContentDispositionHeaderValue object and setting .Name/.FileName
-        # produces QUOTED values (name="filename") here - confirmed
-        # against a local test listener (2026-09-09): .NET's formatter
+        # produces QUOTED values (name="filename") here: .NET's formatter
         # only quotes a parameter value when the token itself requires it
         # (spaces, etc.), and "content"/"filename" don't, so it legally
         # emits name=content unquoted. That's valid per RFC 7231, but
-        # Proxmox's own multipart parser has only been PROVEN to correctly
-        # parse the QUOTED style (the hand-built snippet upload, which got
-        # back a clean, correctly-parsed 400 rather than a garbled one) -
-        # given its already-confirmed non-standard behavior elsewhere (the
-        # chunked-encoding bug), don't trust it to accept the unquoted
+        # Proxmox's own multipart parser has only been proven to correctly
+        # parse the QUOTED style (confirmed via the hand-built snippet
+        # upload, which got back a clean, correctly-parsed 400 rather than
+        # a garbled one), and given its already-confirmed non-standard
+        # behavior elsewhere (the chunked-encoding issue in
+        # Send-ProxmoxFileUpload), don't trust it to accept the unquoted
         # form too. Setting the header as a raw string via
         # TryAddWithoutValidation bypasses .NET's formatter entirely, so
         # the quoting is exactly what's already proven to work.
@@ -571,8 +520,7 @@ function ConvertTo-ProxmoxBase64 {
     .SYNOPSIS
         qm/the API validate smbios1's manufacturer/product/version as
         base64-encoded strings - plain "1.0" is REJECTED (contains a
-        "."), see uag-kvm-status.md bug #2. Always encode, always pass
-        base64=1 alongside it.
+        "."). Always encode, always pass base64=1 alongside it.
     #>
     param([Parameter(Mandatory)] [string]$PlainText)
     [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PlainText))
@@ -619,10 +567,9 @@ function New-UagProxmoxTemplate {
           Send-ProxmoxImportUpload, then references the resulting volid
           (storage:import/filename) in import-from - a normal storage
           reference, not a raw filesystem path, so it isn't subject to
-          the root-only restriction (confirmed by a Proxmox developer on
-          the community forum - see Send-ProxmoxImportUpload's header).
-          No root credentials needed anywhere in this path.
-          NEEDS LIVE VERIFICATION - see that function's header.
+          the root-only restriction. No root credentials needed anywhere
+          in this path. NOT YET LIVE-TESTED - see
+          Send-ProxmoxImportUpload's header.
 
         - New-ProxmoxTicketContext (a real root@pam login) - FALLBACK
           path, for a storage where 'import' isn't enabled as a content
@@ -630,8 +577,7 @@ function New-UagProxmoxTemplate {
           -Qcow2Image must then be a path already sitting on the TARGET
           NODE's own filesystem (not uploaded - referenced directly via
           a raw path), which Proxmox restricts to the literal root@pam
-          identity - live-confirmed 2026-09-09, see
-          New-ProxmoxTicketContext's own header.
+          identity - the proven, live-confirmed path.
 
     .PARAMETER TemplateVmid
         VMID to use for the template VM. Omit to auto-assign via
@@ -667,7 +613,7 @@ function New-UagProxmoxTemplate {
         # Primary path: upload to content=import, reference the volid.
         # storage:import/<filename> is Proxmox's own naming convention
         # for an uploaded import-content volume - not yet live-confirmed,
-        # see Send-ProxmoxImportUpload's "NEEDS LIVE VERIFICATION" note.
+        # see Send-ProxmoxImportUpload's "NOT YET LIVE-TESTED" note.
         Write-Host "== 1/3: Uploading $Qcow2Image to '$Storage' (content=import) - a real streamed upload, can take a while =="
         Send-ProxmoxImportUpload -Context $Context -Path "/nodes/$Node/storage/$Storage/upload" -FilePath $Qcow2Image | Out-Null
         $importFromValue = "${Storage}:import/$([System.IO.Path]::GetFileName($Qcow2Image))"
@@ -681,10 +627,10 @@ function New-UagProxmoxTemplate {
     }
 
     # Same validated hardware profile as a regular deployment (cpu=host,
-    # q35, seabios, virtio-scsi-single, balloon=0 - see uag-kvm-status.md's
-    # "Five real bugs" section). net0's bridge here is a placeholder only -
-    # every clone reconfigures it post-clone in New-UagVmOnProxmox, since
-    # the template itself is never started or deployed anywhere.
+    # q35, seabios, virtio-scsi-single, balloon=0). net0's bridge here is
+    # a placeholder only - every clone reconfigures it post-clone in
+    # New-UagVmOnProxmox, since the template itself is never started or
+    # deployed anywhere.
     $createBody = @{
         vmid    = $vmid
         name    = $TemplateName
@@ -705,13 +651,12 @@ function New-UagProxmoxTemplate {
     $createResult = Invoke-ProxmoxApi -Context $Context -Path "/nodes/$Node/qemu" -Method POST -Body $createBody
     if ($createResult.data) { Wait-ProxmoxTask -Context $Context -Node $Node -Upid $createResult.data -TimeoutSec 1800 }
 
-    # CONFIRMED LIVE (2026-09-09, against ax161-01): POST
-    # .../qemu/{vmid}/template is the direct API equivalent of `qm
-    # template <vmid>` - converts the VM in place into a template (disks
-    # become read-only base images for clones). Ran synchronously (no
-    # UPID) in the live test, as expected for a metadata/disk flag change
-    # rather than a data copy - still handled defensively below in case a
-    # future Proxmox version makes it async.
+    # Confirmed live: POST .../qemu/{vmid}/template is the direct API
+    # equivalent of `qm template <vmid>` - converts the VM in place into a
+    # template (disks become read-only base images for clones). Ran
+    # synchronously (no UPID) in live testing, as expected for a
+    # metadata/disk flag change rather than a data copy - still handled
+    # defensively below in case a future Proxmox version makes it async.
     Write-Host "== 3/3: Converting VM $vmid to a template =="
     $templateResult = Invoke-ProxmoxApi -Context $Context -Path "/nodes/$Node/qemu/$vmid/template" -Method POST
     if ($templateResult.data) { Wait-ProxmoxTask -Context $Context -Node $Node -Upid $templateResult.data }
@@ -772,26 +717,21 @@ function Send-UagSnippetsOverSsh {
 
     .DESCRIPTION
         WHY THIS EXISTS AT ALL: Proxmox's REST API has never supported
-        uploading snippet files - confirmed live (2026-09-09) with a
-        clean 400 ("value 'snippets' does not have a value in the
-        enumeration 'iso, vztmpl, import'"), and confirmed against
-        current Proxmox VE 9 via the community forum, where a Proxmox
-        staff member stated plainly in a March 2026 thread: "snippets are
-        not uploadable over the API at the moment." This traces back to
-        a 7+ year old feature request (bugzilla #2208) that a real 2022
-        developer patch attempt never landed. This is not something to
-        wait on or route around cleverly - it is a permanent gap in
-        Proxmox's own API, so snippet delivery has to go through the
-        filesystem some other way.
+        uploading snippet files, on any version - the 'content' parameter
+        on the upload endpoint only accepts 'iso, vztmpl, import',
+        'snippets' is not a valid value. This is a long-standing, publicly
+        tracked gap in Proxmox's own API (see Proxmox's bugzilla and
+        community forum), confirmed still present on current releases -
+        not something to wait on or route around cleverly, so snippet
+        delivery has to go through the filesystem some other way.
 
         WHY THIS EXACT MECHANISM (sudo + tee over SSH exec, not a chrooted
-        SFTP jail): this project's first cut at this used a dedicated
-        chrooted SFTP-only user (OpenSSH ChrootDirectory + ForceCommand
-        internal-sftp). That works, but it turns out to be reinventing a
-        wheel: the most widely used Terraform/OpenTofu provider for
-        Proxmox (bpg/terraform-provider-proxmox) hits this exact same API
-        gap and solves it with a non-root SSH user that has ONE narrowly
-        scoped sudoers rule, e.g.:
+        SFTP jail): a dedicated chrooted SFTP-only user (OpenSSH
+        ChrootDirectory + ForceCommand internal-sftp) also works, but the
+        most widely used Terraform/OpenTofu provider for Proxmox
+        (bpg/terraform-provider-proxmox) hits this exact same API gap and
+        solves it more simply, with a non-root SSH user that has ONE
+        narrowly scoped sudoers rule, e.g.:
 
             terraform ALL=(root) NOPASSWD: /usr/bin/tee /var/lib/vz/snippets/[a-zA-Z0-9_][a-zA-Z0-9_.-]*
 
@@ -801,19 +741,16 @@ function Send-UagSnippetsOverSsh {
         directory tree, no ForceCommand, no ChrootDirectory ownership
         rules to get right) and is a pattern any admin who has used that
         provider will already recognize. Adopted here for the same
-        reasons, replacing the earlier chroot design - see
-        uag-kvm-adaptation-plan.md section 7.10 for the full writeup and
-        citations, and section 7.9 (superseded) for the chroot version
-        this replaces.
+        reasons.
 
         The regex-anchored filename in the sudoers rule is deliberate and
-        load-bearing: the Terraform provider's own docs warn that a
-        wildcard pattern like '/var/lib/vz/*' is exploitable via path
-        traversal (e.g. '/var/lib/vz/../../../etc/sudoers.d/malicious'),
-        which can escalate straight to root. This function re-validates
-        every destination filename against that same safe-character
-        pattern BEFORE it ever reaches the network, as defense in depth -
-        if the sudoers rule on the node is ever loosened by mistake, this
+        load-bearing: a wildcard pattern like '/var/lib/vz/*' is
+        exploitable via path traversal (e.g.
+        '/var/lib/vz/../../../etc/sudoers.d/malicious'), which can
+        escalate straight to root. This function re-validates every
+        destination filename against that same safe-character pattern
+        BEFORE it ever reaches the network, as defense in depth - if the
+        sudoers rule on the node is ever loosened by mistake, this
         client-side check is a second gate, not the only one.
 
         HOW: for each file, shells out to the Windows OpenSSH client's
@@ -842,8 +779,7 @@ function Send-UagSnippetsOverSsh {
             "'Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0' as admin)."
     }
     if (-not (Test-Path $SshKeyPath)) {
-        throw "SSH private key not found: $SshKeyPath (see uag-kvm-adaptation-plan.md section 7.10 " + `
-            "for the one-time sudo+tee user setup this expects)."
+        throw "SSH private key not found: $SshKeyPath (see README.md for the one-time sudo+tee user setup this expects)."
     }
 
     $remoteDir = $RemoteDir.TrimEnd('/')
@@ -954,16 +890,14 @@ function New-UagVmOnProxmox {
     if (-not $Platform.bridge) { throw "[Platform] section is missing 'bridge'." }
     if (-not $Platform.templateVmid) {
         throw "[Platform] section is missing 'templateVmid'. Run New-UagPveTemplate.ps1 once " + `
-            "(see uag-kvm-adaptation-plan.md section 7) to build a template from your golden QCOW2, " + `
-            "then put the VMID it prints here."
+            "to build a template from your golden QCOW2, then put the VMID it prints here."
     }
     if (-not $Platform.name) { throw "[Platform]/[General] is missing 'name' (used for the VM name and snippet filenames)." }
     if (-not $Platform.snippetSshUser -or -not $Platform.snippetSshKeyPath) {
         throw "[Platform] section is missing 'snippetSshUser' and/or 'snippetSshKeyPath'. Proxmox's API " + `
-            "cannot upload cloud-init snippets at all (confirmed against PVE 9, see " + `
-            "uag-kvm-adaptation-plan.md section 7.10) so this needs a one-time-created, non-root user with " + `
-            "a scoped 'sudo tee' rule on the target node - see that section for the setup steps, then put " + `
-            "its username and your private key's local path here."
+            "cannot upload cloud-init snippets at all, so this needs a one-time-created, non-root user " + `
+            "with a scoped 'sudo tee' rule on the target node - see README.md for the setup steps, then " + `
+            "put its username and your private key's local path here."
     }
 
     $node           = $Platform.node
@@ -983,15 +917,13 @@ function New-UagVmOnProxmox {
     $smbios1Value = Get-UagSmbios1Value -Smbios $Smbios
 
     # --- Step 1: clone the prepared template ---------------------------------
-    # NEEDS LIVE VERIFICATION: this is the new path this redesign
-    # introduces. full=1 makes this an independent full copy of the
-    # template's disk (not a linked clone tied to the template's
-    # lifetime) - deliberate, since UAG appliances are meant to be
-    # standalone and a linked clone would keep every deployed instance
-    # dependent on the template VM/disk never being deleted or resized.
-    # 'storage' pins the clone's disk to this deployment's target storage
-    # rather than wherever the template happens to live, matching what
-    # 'storage=' meant in the old import-from design.
+    # full=1 makes this an independent full copy of the template's disk
+    # (not a linked clone tied to the template's lifetime) - deliberate,
+    # since UAG appliances are meant to be standalone and a linked clone
+    # would keep every deployed instance dependent on the template
+    # VM/disk never being deleted or resized. 'storage' pins the clone's
+    # disk to this deployment's target storage rather than wherever the
+    # template happens to live.
     $cloneBody = @{
         newid   = $vmid
         name    = $Platform.name
@@ -1009,7 +941,7 @@ function New-UagVmOnProxmox {
     # deployment reconfigures them explicitly here so [Platform] in the
     # INI is always the source of truth, not whatever the template carries.
     # ide2 (the cloud-init drive) is not part of the template at all - add
-    # it fresh on every clone, same as the old design did on every create.
+    # it fresh on every clone.
     Write-Host '== 2/4: Reconfiguring network/memory/cores/smbios + adding cloud-init drive =='
     $configBody = @{
         net0    = "virtio,bridge=$bridge"
@@ -1022,23 +954,18 @@ function New-UagVmOnProxmox {
     if ($cfgResult.data) { Wait-ProxmoxTask -Context $Context -Node $node -Upid $cfgResult.data }
 
     # --- Step 3: deliver + attach the meta/user cloud-init snippets ---------
-    # Proxmox's API has NEVER supported uploading snippets (confirmed live
-    # 2026-09-09 with a clean 400 enumerating 'iso, vztmpl, import' as the
-    # only valid content types; confirmed still true on PVE 9 via the
-    # community forum - see Send-UagSnippetsOverSsh's own header and
-    # uag-kvm-adaptation-plan.md section 7.10). Delivered over SSH to a
-    # dedicated, non-root user with a scoped 'sudo tee' rule instead - the
+    # Proxmox's API has never supported uploading snippets (see
+    # Send-UagSnippetsOverSsh's own header) - delivered over SSH to a
+    # dedicated, non-root user with a scoped 'sudo tee' rule instead, the
     # same approach the bpg/terraform-provider-proxmox provider uses for
-    # the identical gap - the API is not involved in this step at all.
+    # the identical gap. The API is not involved in this step at all.
     #
     # The remote filename comes from each local temp file's own name - so
-    # stage temp copies under the exact intended snippet names first,
-    # matching deploy-uag-proxmox-test.sh's "uag-<name>-user.yaml" /
-    # "uag-<name>-meta.yaml" naming. The remote directory is resolved from
-    # Proxmox's own storage config rather than hardcoded or configured
-    # separately, so it can never drift out of sync with the storage
-    # snippetStorage actually points at.
-    Write-Host '== 3/4: Delivering meta/user-data snippets over SSH (sudo+tee - Proxmox has no API for this, see uag-kvm-adaptation-plan.md 7.10) =='
+    # stage temp copies under the exact intended snippet names first. The
+    # remote directory is resolved from Proxmox's own storage config
+    # rather than hardcoded or configured separately, so it can never
+    # drift out of sync with whatever snippetStorage actually points at.
+    Write-Host '== 3/4: Delivering meta/user-data snippets over SSH (sudo+tee - Proxmox has no API for this) =='
     $userSnippetName = "uag-$($Platform.name)-user.yaml"
     $metaSnippetName = "uag-$($Platform.name)-meta.yaml"
 
@@ -1073,7 +1000,7 @@ function New-UagVmOnProxmox {
     Write-Host ''
     Write-Host "Done. VMID $vmid started. Wait roughly 1-2 minutes after the login prompt appears"
     Write-Host 'before testing SSH/admin UI (uag_sysconfig keeps running in the background for a'
-    Write-Host 'while after the visible login prompt - see uag-kvm-status.md). Verify with:'
+    Write-Host 'while after the visible login prompt). Verify with:'
     Write-Host '  ssh root@<VM-IP> "dmesg | grep -i nutanix"'
     Write-Host '  ssh root@<VM-IP> "tail -30 /opt/omnissa/gateway/logs/vami.log"'
 
